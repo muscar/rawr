@@ -1,0 +1,4 @@
+Hello world!
+Hear me rawr!
+Hello, 世界!
+rawr is a rewrite of AWK in Rust.
