@@ -2,9 +2,9 @@ use regex::bytes::Regex;
 use std::{
     error::Error,
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     iter::Peekable,
-    path::PathBuf,
+    os::unix::prelude::{AsRawFd, FromRawFd},
     str::Chars,
 };
 
@@ -174,66 +174,75 @@ impl<'a> Parser<'a> {
 
 // Compile
 
-fn compile_program<R>(program: Program) -> impl Fn(R)
+fn compile_program<R>(program: Program) -> impl Fn(&mut State, R)
 where
-    R: BufRead,
+    R: Iterator<Item = Record>,
 {
     let mut compiled_pattern_actions = vec![];
     for (pattern, action) in program.body {
         compiled_pattern_actions.push(compile_pattern_action(pattern, action));
     }
-    move |reader: R| {
-        let rec_reader = RecordReader::new(reader);
-        for rec in rec_reader.records() {
+    move |state: &mut State, records: R| {
+        for r in records {
             for cpa in &compiled_pattern_actions {
-                cpa(&rec);
+                cpa(state, &r);
             }
         }
     }
 }
 
-fn compile_pattern_action(pattern: Option<Pattern>, action: Action) -> Box<dyn Fn(&Record)> {
+fn compile_pattern_action(
+    pattern: Option<Pattern>,
+    action: Action,
+) -> Box<dyn Fn(&mut State, &Record)> {
     let compiled_action = compile_action(action);
     match pattern {
         Some(p) => {
             let compiled_pattern = compile_pattern(p);
-            Box::new(move |rec: &Record| {
-                if compiled_pattern(rec) {
-                    compiled_action(rec);
+            Box::new(move |state: &mut State, record: &Record| {
+                if compiled_pattern(state, record) {
+                    compiled_action(state, record);
                 }
             })
         }
-        None => Box::new(move |rec: &Record| {
-            compiled_action(rec);
+        None => Box::new(move |state: &mut State, record: &Record| {
+            compiled_action(state, record);
         }),
     }
 }
 
-fn compile_pattern(pattern: Pattern) -> impl Fn(&Record) -> bool {
+fn compile_pattern(pattern: Pattern) -> impl Fn(&mut State, &Record) -> bool {
     match pattern {
-        Pattern::Re(re) => move |rec: &Record| re.is_match(rec.bytes()),
+        Pattern::Re(re) => move |_state: &mut State, record: &Record| re.is_match(record.bytes()),
     }
 }
 
-fn compile_action(action: Action) -> impl Fn(&Record) {
+fn compile_action(action: Action) -> impl Fn(&mut State, &Record) {
     let mut compiled_actions = vec![];
     for s in action.body {
         compiled_actions.push(compile_statement(s));
     }
-    move |rec: &Record| {
+    move |state: &mut State, record: &Record| {
         for ca in &compiled_actions {
-            ca(rec);
+            ca(state, record);
         }
     }
 }
 
-fn compile_statement(statement: Statement) -> impl Fn(&Record) {
+fn compile_statement(statement: Statement) -> impl Fn(&mut State, &Record) {
     match statement {
-        Statement::Print => |rec: &Record| println!("{}", String::from_utf8_lossy(rec.bytes())),
+        Statement::Print => |state: &mut State, record: &Record| {
+            state.out.write(record.bytes()).unwrap();
+            state.out.write(&[b'\n']).unwrap();
+        },
     }
 }
 
 // Eval
+
+struct State {
+    out: BufWriter<File>,
+}
 
 struct Field<'a> {
     index: usize,
@@ -287,27 +296,39 @@ impl<R: BufRead> RecordReader<R> {
     }
 }
 
+fn compile<R: Iterator<Item = Record>>(
+    prog: &str,
+) -> Result<impl Fn(&mut State, R), Box<dyn Error>> {
+    let lexer = Lexer::new(&prog);
+    let mut parser = Parser::new(lexer);
+    let node = parser.parse()?;
+    Ok(compile_program(node))
+}
+
 fn rawr_main(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let prog = match args.next() {
         Some(pat) => pat,
         None => panic!("usage: rawr PROGRAM FILE..."),
     };
-    let paths = args.map(PathBuf::from).collect::<Vec<_>>();
-
-    let lexer = Lexer::new(&prog);
-    let mut parser = Parser::new(lexer);
-    let node = parser.parse()?;
-
+    let mut paths = args.collect::<Vec<_>>();
     if paths.is_empty() {
-        let stdin = io::stdin();
-        let compiled_prog = compile_program(node);
-        compiled_prog(stdin.lock());
-    } else {
-        let compiled_prog = compile_program(node);
-        for p in paths {
-            let f = File::open(p)?;
-            compiled_prog(BufReader::new(f));
-        }
+        paths.push("-".into());
+    }
+    let compiled_prog = compile(&prog)?;
+
+    let stdout = AsRawFd::as_raw_fd(&io::stdout());
+    let stdout: File = unsafe { FromRawFd::from_raw_fd(stdout) };
+    let out = std::io::BufWriter::with_capacity(32 * 1024, stdout);
+    let mut state = State { out };
+
+    for p in paths {
+        let f = if p == "-" {
+            unsafe { File::from_raw_fd(0) }
+        } else {
+            File::open(p)?
+        };
+        let rec_reader = RecordReader::new(BufReader::new(f));
+        compiled_prog(&mut state, rec_reader.records());
     }
 
     Ok(())
