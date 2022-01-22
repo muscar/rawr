@@ -1,4 +1,5 @@
-use regex::bytes::Regex;
+use core::panic;
+use regex::Regex;
 use std::{
     error::Error,
     fs::File,
@@ -9,6 +10,11 @@ use std::{
 };
 
 // AST
+
+#[derive(Debug)]
+struct Program {
+    body: Vec<(Option<Pattern>, Action)>,
+}
 
 #[derive(Debug)]
 enum Pattern {
@@ -22,19 +28,22 @@ struct Action {
 
 #[derive(Debug)]
 enum Statement {
-    Print,
+    Print(Vec<Expression>),
 }
 
-#[derive(Debug)]
-struct Program {
-    body: Vec<(Option<Pattern>, Action)>,
+#[derive(Debug, Clone)]
+enum Expression {
+    IntLit(i64),
+    Field(Box<Expression>),
 }
 
 // Scan & parse
 
 #[derive(Debug, PartialEq, Eq)]
 enum TokenKind {
+    IntLit,
     RegexLit,
+    Dollar,
     LBrace,
     RBrace,
     Print,
@@ -72,6 +81,10 @@ impl<'a> Iterator for Lexer<'a> {
         }
         match self.chars.peek() {
             None => None,
+            Some('$') => {
+                self.chars.next();
+                Some(Token::new(TokenKind::Dollar, "$".to_string()))
+            }
             Some('{') => {
                 self.chars.next();
                 Some(Token::new(TokenKind::LBrace, "{".to_string()))
@@ -91,6 +104,13 @@ impl<'a> Iterator for Lexer<'a> {
                 }
                 self.chars.next();
                 Some(Token::new(TokenKind::RegexLit, lexeme))
+            }
+            Some(c) if c.is_digit(10) => {
+                let mut lexeme = String::new();
+                while matches!(self.chars.peek(), Some(c) if c.is_digit(10)) {
+                    lexeme.push(self.chars.next().unwrap());
+                }
+                Some(Token::new(TokenKind::IntLit, lexeme))
             }
             Some(c) if c.is_alphabetic() => {
                 let mut lexeme = String::new();
@@ -145,7 +165,9 @@ impl<'a> Parser<'a> {
                     body: vec![(
                         pattern,
                         Action {
-                            body: vec![Statement::Print],
+                            body: vec![Statement::Print(vec![Expression::Field(Box::new(
+                                Expression::IntLit(0),
+                            ))])],
                         },
                     )],
                 })
@@ -168,142 +190,283 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Statement {
         self.expect(TokenKind::Print);
-        Statement::Print
+        Statement::Print(vec![self.parse_expression()])
+    }
+
+    fn parse_expression(&mut self) -> Expression {
+        match self
+            .tokens
+            .next()
+            .expect("syntactic error: unexpected end of file")
+        {
+            Token {
+                kind: TokenKind::IntLit,
+                text,
+            } => Expression::IntLit(text.parse().unwrap()),
+            Token {
+                kind: TokenKind::Dollar,
+                ..
+            } => {
+                let idx = self.parse_expression();
+                Expression::Field(Box::new(idx))
+            }
+            tok => panic!("syntactic error: expecting expression near {:?}", tok.kind),
+        }
     }
 }
 
 // Compile
 
-fn compile_program<R>(program: Program) -> impl Fn(&mut State, R)
-where
-    R: Iterator<Item = Record>,
-{
-    let mut compiled_pattern_actions = vec![];
-    for (pattern, action) in program.body {
-        compiled_pattern_actions.push(compile_pattern_action(pattern, action));
+struct CodeGen {
+    code: Vec<Op>,
+}
+
+impl CodeGen {
+    fn new() -> Self {
+        Self { code: vec![] }
     }
-    move |state: &mut State, records: R| {
-        for r in records {
-            for cpa in &compiled_pattern_actions {
-                cpa(state, &r);
+
+    fn emit(&mut self, op: Op) {
+        self.code.push(op);
+    }
+}
+
+fn compile(gen: &mut CodeGen, source: &str) -> Result<(), Box<dyn Error>> {
+    let lexer = Lexer::new(source);
+    let mut parser = Parser::new(lexer);
+    let node = parser.parse()?;
+    compile_program(gen, &node);
+    Ok(())
+}
+
+fn compile_program(gen: &mut CodeGen, prog: &Program) {
+    for pattern_action in &prog.body {
+        compile_pattern_action(gen, pattern_action);
+    }
+}
+
+fn compile_pattern_action(gen: &mut CodeGen, pattern_action: &(Option<Pattern>, Action)) {
+    if let Some(pattern) = &pattern_action.0 {
+        compile_pattern(gen, pattern);
+    }
+    compile_action(gen, &pattern_action.1);
+}
+
+fn compile_pattern(gen: &mut CodeGen, pattern: &Pattern) {
+    match pattern {
+        Pattern::Re(re) => {
+            gen.emit(ld_rec());
+            gen.emit(match_re(re.clone()));
+        }
+    }
+}
+
+fn compile_action(gen: &mut CodeGen, action: &Action) {
+    for stmt in &action.body {
+        compile_statement(gen, stmt);
+    }
+}
+
+fn compile_statement(gen: &mut CodeGen, stmt: &Statement) {
+    match stmt {
+        Statement::Print(args) => {
+            for expr in args.iter().rev() {
+                compile_expression(gen, expr);
+            }
+            gen.emit(print(args.len()));
+        }
+    }
+}
+
+fn compile_expression(gen: &mut CodeGen, expr: &Expression) {
+    match expr {
+        Expression::IntLit(n) => gen.emit(ldc_i8(*n)),
+        Expression::Field(idx) => {
+            compile_expression(gen, idx);
+            gen.emit(ld_fld())
+        }
+    }
+}
+
+// VM
+
+type Op = Box<dyn Fn(&mut State, &Record) -> i64>;
+
+fn ldc_i8(n: i64) -> Op {
+    Box::new(move |state: &mut State, _: &Record| {
+        // println!("ldc_i8 {:?}", n);
+        state.stack.push(Value::Int(n));
+        1
+    })
+}
+
+fn ld_rec() -> Op {
+    Box::new(move |state: &mut State, record: &Record| {
+        // println!("ld_rec");
+        state.stack.push(Value::Str(record.text.clone()));
+        1
+    })
+}
+
+fn ld_fld() -> Op {
+    Box::new(|state: &mut State, record: &Record| {
+        match state.stack.pop().map(|v| v.int_val()).unwrap() {
+            0 => {
+                // println!("ld_rec");
+                state.stack.push(Value::Str(record.text.clone()));
+                1
+            }
+            idx => {
+                // println!("ldc_fld {:?}", idx);
+                state
+                    .stack
+                    .push(Value::Str(record.get_field((idx - 1) as usize).text));
+                1
             }
         }
-    }
+    })
 }
 
-fn compile_pattern_action(
-    pattern: Option<Pattern>,
-    action: Action,
-) -> Box<dyn Fn(&mut State, &Record)> {
-    let compiled_action = compile_action(action);
-    match pattern {
-        Some(p) => {
-            let compiled_pattern = compile_pattern(p);
-            Box::new(move |state: &mut State, record: &Record| {
-                if compiled_pattern(state, record) {
-                    compiled_action(state, record);
-                }
-            })
+fn match_re(re: Regex) -> Op {
+    Box::new(move |state: &mut State, _: &Record| {
+        let v = state.stack.pop().map(|v| v.str_val()).unwrap();
+        // println!("match_re {:?} {:?}", re, v);
+        let v = if re.is_match(&v) { 1 } else { 0 };
+        // state.stack.push(Value::Int(v));
+        v
+    })
+}
+
+fn print(argc: usize) -> Op {
+    Box::new(move |state: &mut State, _: &Record| {
+        // println!("print/{:?}", argc);
+        for _ in 0..argc {
+            let x = state.stack.pop().unwrap();
+            state
+                .output
+                .write_fmt(format_args!("{}", x.str_val()))
+                .unwrap();
+            state.output.write_all(&[b'\n']).unwrap();
         }
-        None => Box::new(move |state: &mut State, record: &Record| {
-            compiled_action(state, record);
-        }),
-    }
+        1
+    })
 }
 
-fn compile_pattern(pattern: Pattern) -> impl Fn(&mut State, &Record) -> bool {
-    match pattern {
-        Pattern::Re(re) => move |_state: &mut State, record: &Record| re.is_match(record.bytes()),
-    }
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    Str(String),
 }
 
-fn compile_action(action: Action) -> impl Fn(&mut State, &Record) {
-    let mut compiled_actions = vec![];
-    for s in action.body {
-        compiled_actions.push(compile_statement(s));
+impl Value {
+    fn int_val(&self) -> i64 {
+        match self {
+            Value::Int(n) => *n,
+            Value::Str(s) => s.parse().unwrap(),
+        }
     }
-    move |state: &mut State, record: &Record| {
-        for ca in &compiled_actions {
-            ca(state, record);
+
+    fn str_val(&self) -> String {
+        match self {
+            Value::Int(n) => n.to_string(),
+            Value::Str(s) => s.clone(),
         }
     }
 }
-
-fn compile_statement(statement: Statement) -> impl Fn(&mut State, &Record) {
-    match statement {
-        Statement::Print => |state: &mut State, record: &Record| {
-            state.out.write(record.bytes()).unwrap();
-            state.out.write(&[b'\n']).unwrap();
-        },
-    }
-}
-
-// Eval
 
 struct State {
-    out: BufWriter<File>,
+    output: BufWriter<File>,
+    stack: Vec<Value>,
 }
 
-struct Field<'a> {
-    index: usize,
-    bytes: &'a [u8],
-}
-
-impl<'a> Field<'a> {
-    fn new(index: usize, bytes: &'a [u8]) -> Self {
-        Self { index, bytes }
-    }
-
-    fn bytes(&self) -> &'a [u8] {
-        self.bytes
+impl State {
+    fn new(out: BufWriter<File>) -> Self {
+        Self {
+            output: out,
+            stack: vec![],
+        }
     }
 }
 
-struct Record {
-    bytes: Vec<u8>,
+struct RecordReader {
+    reader: BufReader<File>,
 }
 
-impl Record {
-    fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-
-    fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    fn fields(&self) -> impl Iterator<Item = Field> {
-        self.bytes
-            .split(|c| *c == b' ')
-            .enumerate()
-            .map(|(idx, bytes)| Field::new(idx, bytes))
-    }
-}
-
-struct RecordReader<R: BufRead> {
-    reader: R,
-}
-
-impl<R: BufRead> RecordReader<R> {
-    fn new(reader: R) -> Self {
+impl RecordReader {
+    fn new(reader: BufReader<File>) -> Self {
         Self { reader }
     }
 
     fn records(self) -> impl Iterator<Item = Record> {
         self.reader
             .split(b'\n')
-            .map(|bytes| Record::new(bytes.unwrap()))
+            .map(|bytes| Record::from_utf8(bytes.unwrap()))
     }
 }
 
-fn compile<R: Iterator<Item = Record>>(
-    prog: &str,
-) -> Result<impl Fn(&mut State, R), Box<dyn Error>> {
-    let lexer = Lexer::new(&prog);
-    let mut parser = Parser::new(lexer);
-    let node = parser.parse()?;
-    Ok(compile_program(node))
+struct Record {
+    text: String,
 }
+
+impl Record {
+    fn from_utf8(bytes: Vec<u8>) -> Self {
+        Self {
+            text: String::from_utf8(bytes).unwrap(),
+        }
+    }
+
+    fn get_field(&self, idx: usize) -> Field {
+        Field::new(self.text.split(' ').nth(idx).unwrap().to_string())
+    }
+}
+
+struct Field {
+    text: String,
+}
+
+impl Field {
+    fn new(text: String) -> Self {
+        Self { text }
+    }
+}
+
+enum Input {
+    Stdin,
+    File(String), // TODO: Path, PathBuf?
+}
+
+impl Input {
+    fn get_reader(&self) -> RecordReader {
+        let f = match self {
+            Input::Stdin => unsafe { File::from_raw_fd(0) },
+            Input::File(path) => File::open(path).unwrap(),
+        };
+        RecordReader::new(BufReader::new(f))
+    }
+}
+
+fn run_program(inputs: Vec<Input>, state: &mut State, prog: Vec<Op>) {
+    for (fnr, input) in inputs.iter().enumerate() {
+        // println!("FNR={:?}", fnr);
+        let reader = input.get_reader();
+        for (nr, record) in reader.records().enumerate() {
+            // println!("NR={:?}", nr);
+            let mut ip = 0;
+            while ip < prog.len() {
+                // println!("ip={}", ip);
+                // println!("-> {:?}", state.stack);
+                let step = prog[ip](state, &record);
+                // println!("<- [{step}] {:?}", state.stack);
+                if step == 0 {
+                    break;
+                }
+                ip = (ip as i64 + step) as usize;
+            }
+        }
+    }
+}
+
+// Program
 
 fn rawr_main(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let prog = match args.next() {
@@ -314,22 +477,25 @@ fn rawr_main(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error
     if paths.is_empty() {
         paths.push("-".into());
     }
-    let compiled_prog = compile(&prog)?;
+    let mut gen = CodeGen::new();
+    compile(&mut gen, &prog)?;
 
+    let inputs = paths
+        .iter()
+        .map(|p| {
+            if p == "-" {
+                Input::Stdin
+            } else {
+                Input::File(p.clone())
+            }
+        })
+        .collect::<Vec<_>>();
     let stdout = AsRawFd::as_raw_fd(&io::stdout());
     let stdout: File = unsafe { FromRawFd::from_raw_fd(stdout) };
-    let out = std::io::BufWriter::with_capacity(32 * 1024, stdout);
-    let mut state = State { out };
+    let output = std::io::BufWriter::with_capacity(32 * 1024, stdout);
+    let mut state = State::new(output);
 
-    for p in paths {
-        let f = if p == "-" {
-            unsafe { File::from_raw_fd(0) }
-        } else {
-            File::open(p)?
-        };
-        let rec_reader = RecordReader::new(BufReader::new(f));
-        compiled_prog(&mut state, rec_reader.records());
-    }
+    run_program(inputs, &mut state, gen.code);
 
     Ok(())
 }
