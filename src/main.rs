@@ -1,4 +1,5 @@
 use core::panic;
+use pprof::protos::Message;
 use regex::Regex;
 use std::{
     error::Error,
@@ -468,19 +469,14 @@ fn run_program(inputs: Vec<Input>, state: &mut State, prog: Vec<Op>) {
 
 // Program
 
-fn rawr_main(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let prog = match args.next() {
-        Some(pat) => pat,
-        None => panic!("usage: rawr PROGRAM FILE..."),
-    };
-    let mut paths = args.collect::<Vec<_>>();
-    if paths.is_empty() {
-        paths.push("-".into());
-    }
-    let mut gen = CodeGen::new();
-    compile(&mut gen, &prog)?;
+fn rawr_main(opts: &Options) -> Result<(), Box<dyn Error>> {
+    let guard = pprof::ProfilerGuard::new(100).unwrap();
 
-    let inputs = paths
+    let mut gen = CodeGen::new();
+    compile(&mut gen, &opts.prog)?;
+
+    let inputs = opts
+        .paths
         .iter()
         .map(|p| {
             if p == "-" {
@@ -497,12 +493,66 @@ fn rawr_main(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error
 
     run_program(inputs, &mut state, gen.code);
 
+    match guard.report().build() {
+        Ok(report) => {
+            let mut file = File::create("cpu.prof").unwrap();
+            let profile = report.pprof().unwrap();
+
+            let mut content = Vec::new();
+            profile.encode(&mut content).unwrap();
+            file.write_all(&content).unwrap();
+
+            // println!("report: {:?}", &report);
+        }
+        Err(_) => {}
+    };
+
     Ok(())
 }
 
+#[derive(Debug)]
+struct Options {
+    cpu_profile_file_path: Option<String>,
+    mem_profile_file_path: Option<String>,
+    prog: String,
+    paths: Vec<String>,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let mut result = Options {
+        cpu_profile_file_path: None,
+        mem_profile_file_path: None,
+        prog: "".to_string(),
+        paths: vec![],
+    };
+    let (options, rest_args): (Vec<String>, Vec<String>) = std::env::args()
+        .skip(1)
+        .partition(|arg| arg.starts_with("--"));
+    for opt in options {
+        let parts = opt.split("=").collect::<Vec<_>>();
+        match parts[0] {
+            "--cpuprofile" => result.cpu_profile_file_path = Some(parts[1].to_string()),
+            "--memprofile" => result.mem_profile_file_path = Some(parts[1].to_string()),
+            _ => return Err(format!("unrecognised option: {}", opt)),
+        }
+    }
+    let mut rest_args_it = rest_args.iter();
+    result.prog = match rest_args_it.next() {
+        Some(pat) => pat.clone(),
+        None => panic!("usage: rawr PROGRAM FILE..."),
+    };
+    result.paths = rest_args_it.map(|s| s.clone()).collect::<Vec<_>>();
+    if result.paths.is_empty() {
+        result.paths.push("-".into());
+    }
+    Ok(result)
+}
+
 fn main() {
-    let args = std::env::args().skip(1);
-    let result = rawr_main(args);
+    // let args = std::env::args().skip(1);
+    let opts = parse_args(std::env::args()).unwrap();
+    // println!("{:?}", opts);
+    let result = rawr_main(&opts);
     if let Err(err) = result {
         eprintln!("{}", err);
         std::process::exit(1);
