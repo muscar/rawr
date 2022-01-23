@@ -291,10 +291,10 @@ fn compile_expression(gen: &mut CodeGen, expr: &Expression) {
 
 // VM
 
-type Op = Box<dyn Fn(&mut State, &Record) -> i64>;
+type Op = Box<dyn Fn(&mut Channels, &mut State, &Record) -> i64>;
 
 fn ldc_i8(n: i64) -> Op {
-    Box::new(move |state: &mut State, _: &Record| {
+    Box::new(move |_: &mut Channels, state: &mut State, _: &Record| {
         // println!("ldc_i8 {:?}", n);
         state.stack.push(Value::Int(n));
         1
@@ -302,29 +302,39 @@ fn ldc_i8(n: i64) -> Op {
 }
 
 fn ld_rec() -> Op {
-    Box::new(move |state: &mut State, record: &Record| {
-        // println!("ld_rec");
-        state
-            .stack
-            .push(Value::Str(Vec::from(record.bytes.clone())));
-        1
-    })
+    Box::new(
+        move |_: &mut Channels, state: &mut State, record: &Record| {
+            // println!("ld_rec");
+            let len = record.bytes.len();
+            let idx = state.intern_string(&record.bytes);
+            state.stack.push(Value::Str(idx, len));
+            1
+        },
+    )
 }
 
 fn ld_fld() -> Op {
-    Box::new(|state: &mut State, record: &Record| {
-        match state.stack.pop().map(|v| v.int_val()).unwrap() {
+    Box::new(|_: &mut Channels, state: &mut State, record: &Record| {
+        let idx = match state.stack.pop().unwrap() {
+            Value::Int(n) => n,
+            Value::Str(idx, len) => unsafe { str::from_utf8_unchecked(state.get_string(idx, len)) }
+                .parse::<i64>()
+                .unwrap(),
+        };
+        match idx {
             0 => {
                 // println!("ld_rec");
-                state
-                    .stack
-                    .push(Value::Str(Vec::from(record.bytes.clone())));
+                let len = record.bytes.len();
+                let idx = state.intern_string(&record.bytes);
+                state.stack.push(Value::Str(idx, len));
                 1
             }
             idx => {
-                let field = record.get_field((idx - 1) as usize);
                 // println!("ldc_fld {:?}", idx);
-                state.stack.push(Value::Str(Vec::from(field.bytes)));
+                let field = record.get_field((idx - 1) as usize);
+                let len = field.bytes.len();
+                let idx = state.intern_string(field.bytes);
+                state.stack.push(Value::Str(idx, len));
                 1
             }
         }
@@ -332,62 +342,99 @@ fn ld_fld() -> Op {
 }
 
 fn match_re(re: Regex) -> Op {
-    Box::new(move |state: &mut State, _: &Record| {
-        let v = state.stack.pop().map(|v| v.str_val()).unwrap();
+    Box::new(move |_: &mut Channels, state: &mut State, _: &Record| {
+        let bytes = match state.stack.pop().unwrap() {
+            Value::Int(_) => panic!("not a string"),
+            Value::Str(idx, len) => state.get_string(idx, len),
+        };
         // println!("match_re {:?} {:?}", re, v);
-        let v = if re.is_match(&v) { 1 } else { 0 };
+        let v = if re.is_match(bytes) { 1 } else { 0 };
         // state.stack.push(Value::Int(v));
         v
     })
 }
 
 fn print(argc: usize) -> Op {
-    Box::new(move |state: &mut State, _: &Record| {
-        // println!("print/{:?}", argc);
-        for _ in 0..argc {
-            let x = state.stack.pop().unwrap();
-            state.output.write_all(&x.str_val()).unwrap();
-            state.output.write_all(&[b'\n']).unwrap();
-        }
-        1
-    })
+    Box::new(
+        move |channels: &mut Channels, state: &mut State, _: &Record| {
+            // println!("print/{:?}", argc);
+            for _ in 0..argc {
+                match state.stack.pop().unwrap() {
+                    Value::Int(n) => {
+                        let bytes = &i64::to_ne_bytes(n);
+                        channels.output.write_all(bytes).unwrap();
+                    }
+                    Value::Str(idx, len) => {
+                        channels
+                            .output
+                            .write_all(state.get_string(idx, len))
+                            .unwrap();
+                    }
+                }
+                channels.output.write_all(&[b'\n']).unwrap();
+            }
+            1
+        },
+    )
 }
 
-#[derive(Debug, Clone)]
+struct StrPoolIdx(usize);
+
 enum Value {
     Int(i64),
-    Str(Vec<u8>),
+    Str(StrPoolIdx, usize),
 }
 
 impl Value {
-    fn int_val(&self) -> i64 {
-        match self {
-            Value::Int(n) => *n,
-            Value::Str(s) => {
-                i64::from_str_radix(unsafe { str::from_utf8_unchecked(s) }, 10).unwrap()
-            }
-        }
-    }
+    // fn int_val(&self, str_pool: Vec<u8>) -> i64 {
+    //     match self {
+    //         Value::Int(n) => *n,
+    //         Value::Str(idx, len) => {
+    //             let bytes = &str_pool[idx.0..idx.0 + len];
+    //             i64::from_str_radix(unsafe { str::from_utf8_unchecked(bytes) }, 10).unwrap()
+    //         }
+    //     }
+    // }
 
-    fn str_val(&self) -> Vec<u8> {
-        match self {
-            Value::Int(n) => i64::to_ne_bytes(*n).to_vec(), // XXX
-            Value::Str(s) => s.clone(),                     // XXX
-        }
+    // fn str_val(&self, str_pool: Vec<u8>) -> &[u8] {
+    //     match self {
+    //         Value::Int(n) => &i64::to_ne_bytes(*n).to_vec(), // XXX
+    //         Value::Str(idx, len) => &str_pool[idx.0..idx.0 + len],
+    //     }
+    // }
+}
+
+struct Channels {
+    output: BufWriter<File>,
+}
+
+impl Channels {
+    fn new(output: BufWriter<File>) -> Self {
+        Self { output }
     }
 }
 
 struct State {
-    output: BufWriter<File>,
     stack: Vec<Value>,
+    str_pool: Vec<u8>,
 }
 
 impl State {
-    fn new(out: BufWriter<File>) -> Self {
+    fn new() -> Self {
         Self {
-            output: out,
             stack: vec![],
+            str_pool: vec![],
         }
+    }
+
+    fn intern_string(&mut self, s: &[u8]) -> StrPoolIdx {
+        let idx = StrPoolIdx(self.str_pool.len());
+        self.str_pool.extend_from_slice(s);
+        idx
+    }
+
+    fn get_string(&self, idx: StrPoolIdx, len: usize) -> &[u8] {
+        &self.str_pool[idx.0..idx.0 + len]
     }
 }
 
@@ -446,7 +493,8 @@ impl Input {
     }
 }
 
-fn run_program(inputs: Vec<Input>, state: &mut State, prog: Vec<Op>) {
+fn run_program(inputs: Vec<Input>, mut channels: Channels, prog: Vec<Op>) {
+    let mut state = State::new();
     for (fnr, input) in inputs.iter().enumerate() {
         // println!("FNR={:?}", fnr);
         let reader = input.get_reader();
@@ -456,7 +504,7 @@ fn run_program(inputs: Vec<Input>, state: &mut State, prog: Vec<Op>) {
             while ip < prog.len() {
                 // println!("ip={}", ip);
                 // println!("-> {:?}", state.stack);
-                let step = prog[ip](state, &record);
+                let step = prog[ip](&mut channels, &mut state, &record);
                 // println!("<- [{step}] {:?}", state.stack);
                 if step == 0 {
                     break;
@@ -489,22 +537,19 @@ fn rawr_main(opts: &Options) -> Result<(), Box<dyn Error>> {
     let stdout = AsRawFd::as_raw_fd(&io::stdout());
     let stdout: File = unsafe { FromRawFd::from_raw_fd(stdout) };
     let output = std::io::BufWriter::with_capacity(32 * 1024, stdout);
-    let mut state = State::new(output);
+    let channels = Channels::new(output);
 
-    run_program(inputs, &mut state, gen.code);
+    run_program(inputs, channels, gen.code);
 
-    match guard.report().build() {
-        Ok(report) => {
-            let mut file = File::create("cpu.prof").unwrap();
-            let profile = report.pprof().unwrap();
+    if let Ok(report) = guard.report().build() {
+        let mut file = File::create("cpu.prof").unwrap();
+        let profile = report.pprof().unwrap();
 
-            let mut content = Vec::new();
-            profile.encode(&mut content).unwrap();
-            file.write_all(&content).unwrap();
+        let mut content = Vec::new();
+        profile.encode(&mut content).unwrap();
+        file.write_all(&content).unwrap();
 
-            // println!("report: {:?}", &report);
-        }
-        Err(_) => {}
+        // println!("report: {:?}", &report);
     };
 
     Ok(())
@@ -529,7 +574,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         .skip(1)
         .partition(|arg| arg.starts_with("--"));
     for opt in options {
-        let parts = opt.split("=").collect::<Vec<_>>();
+        let parts = opt.split('=').collect::<Vec<_>>();
         match parts[0] {
             "--cpuprofile" => result.cpu_profile_file_path = Some(parts[1].to_string()),
             "--memprofile" => result.mem_profile_file_path = Some(parts[1].to_string()),
@@ -541,7 +586,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         Some(pat) => pat.clone(),
         None => panic!("usage: rawr PROGRAM FILE..."),
     };
-    result.paths = rest_args_it.map(|s| s.clone()).collect::<Vec<_>>();
+    result.paths = rest_args_it.cloned().collect::<Vec<_>>();
     if result.paths.is_empty() {
         result.paths.push("-".into());
     }
