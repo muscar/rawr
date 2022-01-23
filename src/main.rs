@@ -1,13 +1,13 @@
 use core::panic;
 use pprof::protos::Message;
-use regex::Regex;
+use regex::bytes::Regex;
 use std::{
     error::Error,
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Write},
     iter::Peekable,
     os::unix::prelude::{AsRawFd, FromRawFd},
-    str::Chars,
+    str::{self, Chars},
 };
 
 // AST
@@ -304,7 +304,9 @@ fn ldc_i8(n: i64) -> Op {
 fn ld_rec() -> Op {
     Box::new(move |state: &mut State, record: &Record| {
         // println!("ld_rec");
-        state.stack.push(Value::Str(record.text.clone()));
+        state
+            .stack
+            .push(Value::Str(Vec::from(record.bytes.clone())));
         1
     })
 }
@@ -314,14 +316,15 @@ fn ld_fld() -> Op {
         match state.stack.pop().map(|v| v.int_val()).unwrap() {
             0 => {
                 // println!("ld_rec");
-                state.stack.push(Value::Str(record.text.clone()));
+                state
+                    .stack
+                    .push(Value::Str(Vec::from(record.bytes.clone())));
                 1
             }
             idx => {
+                let field = record.get_field((idx - 1) as usize);
                 // println!("ldc_fld {:?}", idx);
-                state
-                    .stack
-                    .push(Value::Str(record.get_field((idx - 1) as usize).text));
+                state.stack.push(Value::Str(Vec::from(field.bytes)));
                 1
             }
         }
@@ -343,10 +346,7 @@ fn print(argc: usize) -> Op {
         // println!("print/{:?}", argc);
         for _ in 0..argc {
             let x = state.stack.pop().unwrap();
-            state
-                .output
-                .write_fmt(format_args!("{}", x.str_val()))
-                .unwrap();
+            state.output.write_all(&x.str_val()).unwrap();
             state.output.write_all(&[b'\n']).unwrap();
         }
         1
@@ -356,21 +356,23 @@ fn print(argc: usize) -> Op {
 #[derive(Debug, Clone)]
 enum Value {
     Int(i64),
-    Str(String),
+    Str(Vec<u8>),
 }
 
 impl Value {
     fn int_val(&self) -> i64 {
         match self {
             Value::Int(n) => *n,
-            Value::Str(s) => s.parse().unwrap(),
+            Value::Str(s) => {
+                i64::from_str_radix(unsafe { str::from_utf8_unchecked(s) }, 10).unwrap()
+            }
         }
     }
 
-    fn str_val(&self) -> String {
+    fn str_val(&self) -> Vec<u8> {
         match self {
-            Value::Int(n) => n.to_string(),
-            Value::Str(s) => s.clone(),
+            Value::Int(n) => i64::to_ne_bytes(*n).to_vec(), // XXX
+            Value::Str(s) => s.clone(),                     // XXX
         }
     }
 }
@@ -401,33 +403,31 @@ impl RecordReader {
     fn records(self) -> impl Iterator<Item = Record> {
         self.reader
             .split(b'\n')
-            .map(|bytes| Record::from_utf8(bytes.unwrap()))
+            .map(|bytes| Record::new(bytes.unwrap()))
     }
 }
 
 struct Record {
-    text: String,
+    bytes: Vec<u8>,
 }
 
 impl Record {
-    fn from_utf8(bytes: Vec<u8>) -> Self {
-        Self {
-            text: String::from_utf8(bytes).unwrap(),
-        }
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
     }
 
     fn get_field(&self, idx: usize) -> Field {
-        Field::new(self.text.split(' ').nth(idx).unwrap().to_string())
+        Field::new(self.bytes.split(|b| *b == b' ').nth(idx).unwrap())
     }
 }
 
-struct Field {
-    text: String,
+struct Field<'a> {
+    bytes: &'a [u8],
 }
 
-impl Field {
-    fn new(text: String) -> Self {
-        Self { text }
+impl<'a> Field<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
     }
 }
 
